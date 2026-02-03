@@ -1,7 +1,7 @@
 """
-스케줄러 모듈 — 매일 1회 자동 업데이트 확인 + Telegram 알림.
+스케줄러 모듈 — 매일 1회 자동 업데이트 확인.
 
-APScheduler의 AsyncIOScheduler를 사용하여 매일 지정 시각에 check_for_updates를 실행합니다.
+asyncio 기반 스케줄러로 매일 지정 시각에 check_for_updates를 실행합니다.
 on/off 제어가 가능하며, 상태는 config.json에 영속화됩니다.
 
 사용 예:
@@ -31,10 +31,9 @@ JOB_ID = "hira_daily_check"
 
 class HiraScheduler:
     """
-    매일 1회 HIRA 파일 변경을 확인하고 Telegram으로 알림하는 스케줄러.
+    매일 1회 HIRA 파일 변경을 확인하는 스케줄러.
 
     내부적으로 asyncio.Task 기반으로 구현하여 외부 의존성을 최소화합니다.
-    APScheduler 설치 없이도 작동합니다.
     """
 
     def __init__(
@@ -102,9 +101,8 @@ class HiraScheduler:
         return (target - now).total_seconds()
 
     async def _run_check(self) -> dict:
-        """업데이트 확인 + Telegram 알림을 실행합니다."""
+        """업데이트 확인을 실행합니다."""
         from .scraper import check_for_updates
-        from .notifier import notify_updates
 
         logger.info("스케줄된 업데이트 확인 시작…")
         try:
@@ -112,18 +110,9 @@ class HiraScheduler:
             self._last_result = results
             self._last_run = results.get("checked_at", "?")
             self._save_config()
-
-            # Telegram 알림 (변경 있을 때만)
-            await notify_updates(results, force=False)
-
             return results
         except Exception as exc:
             logger.error(f"스케줄 실행 오류: {exc}")
-            # 에러도 Telegram으로 알림
-            from .notifier import send_telegram
-            await send_telegram(
-                f"⚠️ <b>HIRA 모니터링 오류</b>\n\n{exc}",
-            )
             return {"error": str(exc)}
 
     async def _loop(self) -> None:

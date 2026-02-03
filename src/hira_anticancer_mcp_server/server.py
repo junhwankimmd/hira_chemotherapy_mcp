@@ -41,7 +41,6 @@ from .scraper import (
     ensure_playwright,
     scrape_file_list,
 )
-from .notifier import notify_updates, send_telegram
 from .scheduler import HiraScheduler
 from .reader import read_excel, read_pdf
 
@@ -85,18 +84,11 @@ TOOLS = [
         description=(
             "HIRA 심사평가원의 항암화학요법 공고 파일(허가초과 항암요법, "
             "항암화학요법 공고전문)을 서버에서 다운로드하여 로컬 파일과 "
-            "SHA-256 해시/크기를 비교합니다. 변경 감지 시 자동 다운로드 + "
-            "Telegram 알림을 전송합니다."
+            "SHA-256 해시/크기를 비교합니다. 변경 감지 시 자동 다운로드합니다."
         ),
         inputSchema={
             "type": "object",
-            "properties": {
-                "notify": {
-                    "type": "boolean",
-                    "description": "변경 여부와 무관하게 Telegram 알림 전송",
-                    "default": False,
-                },
-            },
+            "properties": {},
         },
     ),
     Tool(
@@ -365,10 +357,6 @@ async def _handle_check_updates(args: dict) -> list[TextContent]:
     """hira_check_updates 실행"""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     results = await check_for_updates(DATA_DIR)
-
-    # Telegram 알림
-    force_notify = args.get("notify", False)
-    await notify_updates(results, force=force_notify)
 
     # 사람이 읽기 좋은 요약 생성
     summary_lines = [
