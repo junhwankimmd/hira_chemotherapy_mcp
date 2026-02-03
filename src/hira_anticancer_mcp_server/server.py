@@ -1,5 +1,5 @@
 """
-HIRA 항암화학요법 MCP Server.
+건강보험심사평가원(HIRA) 항암화학요법 MCP Server.
 
 Claude Desktop / LLM에서 사용 가능한 MCP Tool을 제공합니다.
 

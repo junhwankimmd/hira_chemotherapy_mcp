@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-HIRA 항암화학요법 파일 모니터링 — 단독 CLI 실행기.
+건강보험심사평가원(HIRA) 항암화학요법 공고전문 및 허가초과 항암요법 — 단독 CLI 실행기.
 
 MCP 서버 없이 직접 실행하여 업데이트를 확인합니다.
 cron(Linux/Mac) 또는 작업 스케줄러(Windows)에서 사용합니다.
@@ -141,7 +141,7 @@ async def cmd_daemon() -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="HIRA 항암화학요법 파일 모니터링 CLI"
+        description="건강보험심사평가원(HIRA) 항암화학요법 MCP CLI"
     )
     sub = parser.add_subparsers(dest="command", help="실행할 명령")
 

@@ -1,5 +1,5 @@
 """
-HIRA 항암화학요법 공고 페이지 스크래핑 모듈.
+건강보험심사평가원(HIRA) 항암화학요법 공고 페이지 스크래핑 모듈.
 
 대상 URL:
   https://www.hira.or.kr/bbsDummy.do?pgmid=HIRAA030023030000

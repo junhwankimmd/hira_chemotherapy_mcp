@@ -1,5 +1,5 @@
 """
-HIRA 항암화학요법 파일 리더.
+건강보험심사평가원(HIRA) 항암화학요법 파일 리더.
 
 Excel(허가초과_항암요법)과 PDF(항암화학요법_공고전문)를 파싱하여
 MCP TextContent / ImageContent 형태로 반환합니다.
