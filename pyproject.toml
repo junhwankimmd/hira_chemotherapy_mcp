@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hira-anticancer-mcp-server"
-version = "0.3.0"
+version = "0.3.1"
 description = "HIRA(건강보험심사평가원) 항암화학요법 공고 파일 변경 모니터링 MCP Server + Telegram 알림 + 파일 리더"
 readme = "README.md"
 license = { text = "MIT" }

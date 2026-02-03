@@ -34,18 +34,48 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────
 # 상수
 # ─────────────────────────────────────────────────────────────────────
-TARGET_URL = (
-    "https://www.hira.or.kr/bbsDummy.do"
-    "?pgmid=HIRAA030023030000"
-)
+TARGET_URLS = [
+    # 2026년 리뉴얼 후 새 URL (우선)
+    "https://www.hira.or.kr/rd/anticancer/antiCancerList.do?pgmid=HIRAA030023030000",
+    # 기존 URL (폴백)
+    "https://www.hira.or.kr/bbsDummy.do?pgmid=HIRAA030023030000",
+]
+# 하위 호환용
+TARGET_URL = TARGET_URLS[0]
 
 KST = timezone(timedelta(hours=9))
 
-# 파일 식별 — 페이지 내 링크 텍스트에서 아래 키워드가 모두 포함되면 해당 파일
-FILE_IDENTIFIERS: dict[str, list[str]] = {
-    "허가초과_항암요법": ["허가초과", "항암요법"],
-    "항암화학요법_공고전문": ["공고내용", "전문"],
+# 파일 식별 — 다단계 키워드 매칭 (우선순위 순)
+# 각 file_key에 대해 여러 키워드 조합을 순서대로 시도합니다.
+# 첫 번째로 매칭되는 조합이 사용됩니다.
+#
+# 2026.02 확인: HIRA 페이지의 실제 링크 텍스트:
+#   - "허가초과 항암요법"
+#   - "항암화학요법 등 공고내용 전문"
+#   - "급여인정되지 아니한 요법"
+FILE_IDENTIFIERS: dict[str, list[list[str]]] = {
+    "허가초과_항암요법": [
+        ["허가초과 항암요법"],                 # 정확한 링크 텍스트 (2026.02 확인)
+        ["허가초과", "항암요법"],              # 원래 키워드
+        ["허가초과", "항암"],                  # 축약 폴백
+        ["off-label", "항암"],                # 영문 혼용
+        ["인정되고 있는 허가초과"],             # 직접 제목 매칭
+        ["허가초과"],                          # 최종 폴백 (단일 키워드)
+    ],
+    "항암화학요법_공고전문": [
+        ["항암화학요법 등 공고내용 전문"],       # 정확한 링크 텍스트 (2026.02 확인)
+        ["공고내용 전문"],                      # 핵심 부분
+        ["공고내용", "전문"],                   # 원래 키워드
+        ["항암화학요법", "공고", "전문"],        # 확장 키워드
+        ["공고전문"],                           # 합성어
+        ["항암화학요법", "전문"],               # 부분 매칭
+        ["세부사항", "전문"],                   # 대체 표현
+        ["공고내용"],                           # 최종 폴백
+    ],
 }
+
+# 하위 호환용: 단일 키워드 리스트가 필요한 곳에서 사용
+FILE_KEYS = list(FILE_IDENTIFIERS.keys())
 
 # Playwright 브라우저 공통 설정
 _BROWSER_UA = (
@@ -174,29 +204,110 @@ async def ensure_playwright() -> None:
 
 
 async def _open_page(playwright_instance, *, accept_downloads: bool = False):
-    """브라우저를 열고 HIRA 페이지를 로드합니다. (browser, page) 튜플을 반환."""
+    """브라우저를 열고 HIRA 페이지를 로드합니다. (browser, page) 튜플을 반환.
+    
+    여러 URL을 순서대로 시도하여 첫 번째로 성공하는 URL을 사용합니다.
+    """
     browser = await playwright_instance.chromium.launch(headless=True)
     context = await browser.new_context(
         user_agent=_BROWSER_UA,
         accept_downloads=accept_downloads,
     )
     page = await context.new_page()
-    await page.goto(TARGET_URL, wait_until="networkidle", timeout=30_000)
-    await page.wait_for_timeout(2_000)  # JS 렌더링 마무리 대기
-    return browser, page
+    
+    last_error = None
+    for url in TARGET_URLS:
+        try:
+            resp = await page.goto(url, wait_until="networkidle", timeout=30_000)
+            if resp and resp.status < 400:
+                logger.info(f"HIRA 페이지 로드 성공: {url}")
+                await page.wait_for_timeout(2_000)  # JS 렌더링 마무리 대기
+                return browser, page
+            else:
+                logger.warning(f"HIRA 페이지 HTTP {resp.status if resp else '?'}: {url}")
+                last_error = f"HTTP {resp.status if resp else 'no response'}"
+        except Exception as exc:
+            logger.warning(f"HIRA 페이지 로드 실패: {url} — {exc}")
+            last_error = str(exc)
+    
+    # 모든 URL 실패 시 마지막 에러로 예외 발생
+    await browser.close()
+    raise ConnectionError(
+        f"HIRA 페이지에 접속할 수 없습니다. 모든 URL 시도 실패. 마지막 오류: {last_error}"
+    )
 
 
-def _match_file_key(text: str) -> str | None:
-    """링크 텍스트가 어떤 file_key에 해당하는지 판별합니다."""
-    for key, keywords in FILE_IDENTIFIERS.items():
-        if all(kw in text for kw in keywords):
-            return key
-    return None
+def _match_file_key(text: str) -> tuple[str | None, int]:
+    """
+    링크 텍스트가 어떤 file_key에 해당하는지 판별합니다.
+
+    다단계 매칭: 각 file_key의 키워드 조합을 우선순위 순으로 시도합니다.
+    더 많은 키워드가 매칭될수록 높은 우선순위(낮은 priority 값)를 가집니다.
+
+    Returns:
+        (file_key, priority) — 매칭 실패 시 (None, 999)
+    """
+    for key, keyword_sets in FILE_IDENTIFIERS.items():
+        for priority, keywords in enumerate(keyword_sets):
+            if all(kw in text for kw in keywords):
+                return key, priority
+    return None, 999
 
 
 # ─────────────────────────────────────────────────────────────────────
 # 공개 API
 # ─────────────────────────────────────────────────────────────────────
+async def _find_clickable_elements(page) -> list[dict]:
+    """
+    페이지 내 모든 클릭 가능한 요소를 수집합니다.
+
+    검색 대상:
+      1. <a> 태그 (기본)
+      2. <button> 태그
+      3. onclick 속성이 있는 모든 요소
+      4. iframe 내부의 위 요소들
+
+    Returns:
+        [{"element": ElementHandle, "text": str, "tag": str, "source": str}, ...]
+    """
+    results = []
+
+    # 메인 페이지에서 검색
+    for selector, tag_label in [
+        ("a", "a"),
+        ("button", "button"),
+        ("[onclick]", "onclick_el"),
+    ]:
+        for el in await page.query_selector_all(selector):
+            text = (await el.inner_text()).strip()
+            if text and len(text) > 1:
+                results.append({
+                    "element": el,
+                    "text": text,
+                    "tag": tag_label,
+                    "source": "main",
+                })
+
+    # iframe 내부도 검색
+    for frame in page.frames:
+        if frame == page.main_frame:
+            continue
+        try:
+            for el in await frame.query_selector_all("a"):
+                text = (await el.inner_text()).strip()
+                if text and len(text) > 1:
+                    results.append({
+                        "element": el,
+                        "text": text,
+                        "tag": "a",
+                        "source": f"iframe:{frame.name or frame.url[:50]}",
+                    })
+        except Exception:
+            pass  # iframe 접근 실패 시 무시
+
+    return results
+
+
 async def scrape_file_list() -> list[dict]:
     """
     HIRA 페이지에서 다운로드 가능한 파일 목록과 링크 텍스트를 추출합니다.
@@ -205,7 +316,10 @@ async def scrape_file_list() -> list[dict]:
         [
           {
             "file_key": "허가초과_항암요법",
-            "link_text": "허가초과 항암요법(2025.1.15.)"
+            "link_text": "허가초과 항암요법(2025.1.15.)",
+            "match_priority": 0,
+            "element_tag": "a",
+            "source": "main"
           },
           ...
         ]
@@ -213,17 +327,39 @@ async def scrape_file_list() -> list[dict]:
     from playwright.async_api import async_playwright
 
     results: list[dict] = []
+    best_matches: dict[str, dict] = {}  # file_key → best match
 
     async with async_playwright() as p:
         browser, page = await _open_page(p)
 
-        for link in await page.query_selector_all("a"):
-            text = (await link.inner_text()).strip()
-            key = _match_file_key(text)
-            if key:
-                results.append({"file_key": key, "link_text": text})
+        elements = await _find_clickable_elements(page)
+        logger.info(f"클릭 가능한 요소 수: {len(elements)}")
+
+        for item in elements:
+            key, priority = _match_file_key(item["text"])
+            if key is not None:
+                match = {
+                    "file_key": key,
+                    "link_text": item["text"],
+                    "match_priority": priority,
+                    "element_tag": item["tag"],
+                    "source": item["source"],
+                }
+                # 같은 file_key에 대해 더 높은 우선순위(낮은 값)만 유지
+                if key not in best_matches or priority < best_matches[key]["match_priority"]:
+                    best_matches[key] = match
 
         await browser.close()
+
+    results = list(best_matches.values())
+
+    # 매칭 안 된 파일 진단 로그
+    for key in FILE_KEYS:
+        if key not in best_matches:
+            logger.warning(
+                f"[{key}] 매칭 실패 — 검색된 텍스트 샘플: "
+                + str([e["text"][:50] for e in elements[:20]])
+            )
 
     logger.info(f"스캔 완료 — 감지된 파일 수: {len(results)}")
     return results
@@ -257,22 +393,35 @@ async def download_file(
     from playwright.async_api import async_playwright
 
     data_dir.mkdir(parents=True, exist_ok=True)
-    keywords = FILE_IDENTIFIERS[file_key]
+    keyword_sets = FILE_IDENTIFIERS[file_key]
 
     async with async_playwright() as p:
         browser, page = await _open_page(p, accept_downloads=True)
 
-        # 해당 파일의 링크를 찾기
-        target_link = None
-        link_text = ""
-        for link in await page.query_selector_all("a"):
-            text = (await link.inner_text()).strip()
-            if all(kw in text for kw in keywords):
-                target_link = link
-                link_text = text
-                break
+        # 해당 파일의 링크를 찾기 — 다단계 키워드 매칭
+        # a 태그뿐 아니라 onclick 등 모든 클릭 가능한 요소에서 검색
+        elements = await _find_clickable_elements(page)
 
-        if target_link is None:
+        target_element = None
+        link_text = ""
+        best_priority = 999
+
+        for item in elements:
+            key, priority = _match_file_key(item["text"])
+            if key == file_key and priority < best_priority:
+                target_element = item["element"]
+                link_text = item["text"]
+                best_priority = priority
+
+        if target_element is None:
+            # 진단 로그: 페이지에서 찾은 텍스트 목록
+            sample_texts = [e["text"][:80] for e in elements[:30]]
+            logger.error(
+                f"[{file_key}] 다운로드 링크 매칭 실패.\n"
+                f"  시도한 키워드 조합: {keyword_sets}\n"
+                f"  페이지 내 텍스트 샘플 ({len(elements)}개 중 상위 30):\n"
+                + "\n".join(f"    - {t}" for t in sample_texts)
+            )
             await browser.close()
             raise FileNotFoundError(
                 f"'{file_key}' 에 해당하는 다운로드 링크를 찾을 수 없습니다. "
@@ -283,7 +432,7 @@ async def download_file(
 
         # 클릭 + 다운로드 이벤트 대기
         async with page.expect_download(timeout=timeout_ms) as dl_info:
-            await target_link.click()
+            await target_element.click()
 
         download = await dl_info.value
         suggested = download.suggested_filename or f"{file_key}.xlsx"
