@@ -272,6 +272,25 @@ async def _find_clickable_elements(page) -> list[dict]:
     """
     results = []
 
+    async def _collect(el, tag_label: str, source: str):
+        text = (await el.inner_text()).strip()
+        if text and len(text) > 1:
+            # 부모 <tr> 텍스트도 수집 — 다운로드 버튼처럼
+            # 자체 텍스트가 "다운로드"뿐인 경우 행 컨텍스트로 파일 식별
+            try:
+                row_text = await el.evaluate(
+                    "el => el.closest('tr')?.innerText || ''"
+                )
+            except Exception:
+                row_text = ""
+            results.append({
+                "element": el,
+                "text": text,
+                "row_text": row_text.strip(),
+                "tag": tag_label,
+                "source": source,
+            })
+
     # 메인 페이지에서 검색
     for selector, tag_label in [
         ("a", "a"),
@@ -279,14 +298,7 @@ async def _find_clickable_elements(page) -> list[dict]:
         ("[onclick]", "onclick_el"),
     ]:
         for el in await page.query_selector_all(selector):
-            text = (await el.inner_text()).strip()
-            if text and len(text) > 1:
-                results.append({
-                    "element": el,
-                    "text": text,
-                    "tag": tag_label,
-                    "source": "main",
-                })
+            await _collect(el, tag_label, "main")
 
     # iframe 내부도 검색
     for frame in page.frames:
@@ -294,14 +306,7 @@ async def _find_clickable_elements(page) -> list[dict]:
             continue
         try:
             for el in await frame.query_selector_all("a"):
-                text = (await el.inner_text()).strip()
-                if text and len(text) > 1:
-                    results.append({
-                        "element": el,
-                        "text": text,
-                        "tag": "a",
-                        "source": f"iframe:{frame.name or frame.url[:50]}",
-                    })
+                await _collect(el, "a", f"iframe:{frame.name or frame.url[:50]}")
         except Exception:
             pass  # iframe 접근 실패 시 무시
 
@@ -337,10 +342,13 @@ async def scrape_file_list() -> list[dict]:
 
         for item in elements:
             key, priority = _match_file_key(item["text"])
+            # 자체 텍스트 매칭 실패 시 부모 행 텍스트로 재시도
+            if key is None and item.get("row_text"):
+                key, priority = _match_file_key(item["row_text"])
             if key is not None:
                 match = {
                     "file_key": key,
-                    "link_text": item["text"],
+                    "link_text": item["row_text"] or item["text"],
                     "match_priority": priority,
                     "element_tag": item["tag"],
                     "source": item["source"],
@@ -408,9 +416,12 @@ async def download_file(
 
         for item in elements:
             key, priority = _match_file_key(item["text"])
+            # 자체 텍스트 매칭 실패 시 부모 행 텍스트로 재시도
+            if key is None and item.get("row_text"):
+                key, priority = _match_file_key(item["row_text"])
             if key == file_key and priority < best_priority:
                 target_element = item["element"]
-                link_text = item["text"]
+                link_text = item["row_text"] or item["text"]
                 best_priority = priority
 
         if target_element is None:
