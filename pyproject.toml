@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hira-anticancer-mcp-server"
+version = "0.3.0"
+description = "HIRA(건강보험심사평가원) 항암화학요법 공고 파일 변경 모니터링 MCP Server + Telegram 알림 + 파일 리더"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Junhwan Kim" }
+]
+keywords = ["mcp", "hira", "anticancer", "chemotherapy", "monitoring", "건강보험심사평가원", "telegram"]
+dependencies = [
+    "mcp>=1.2.0",
+    "playwright>=1.40.0",
+    "httpx>=0.25.0",
+    "python-dotenv>=1.0.0",
+    "openpyxl>=3.1.0",
+    "pdfplumber>=0.10.0",
+    "PyMuPDF>=1.23.0",
+]
+
+[project.scripts]
+hira-anticancer-mcp-server = "hira_anticancer_mcp_server:main"
+hira-cli = "hira_anticancer_mcp_server.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hira_anticancer_mcp_server"]
