@@ -200,10 +200,12 @@ TOOLS = [
     Tool(
         name="hira_read_excel",
         description=(
-            "다운로드된 HIRA 허가초과 항암요법 Excel 파일의 내용을 읽습니다. "
-            "머지셀을 자동 처리하고, 암종별 필터링을 지원합니다. "
-            "결과는 Markdown 테이블로 반환됩니다. "
-            "사용 예: 난소암 관련 허가초과 항암요법 목록 조회"
+            "다운로드된 HIRA 허가초과 항암요법 Excel 파일을 읽습니다. "
+            "기본적으로 '인정되고 있는 허가초과 항암요법(용법용량포함)' 시트를 읽으며, "
+            "암종별 필터링을 지원합니다. 결과는 Markdown 테이블로 반환됩니다. "
+            "시트 목록: 안내, 검토중인 허가초과 항암요법, "
+            "인정되고 있는 허가초과 항암요법(용법용량포함), 불승인 요법, "
+            "허가초과 항암요법 변경대비표"
         ),
         inputSchema={
             "type": "object",
@@ -218,7 +220,10 @@ TOOLS = [
                 },
                 "sheet": {
                     "type": "string",
-                    "description": "시트 이름 (생략 시 첫 번째 활성 시트)",
+                    "description": (
+                        "시트 이름. 생략 시 '인정되고 있는 허가초과 항암요법(용법용량포함)' "
+                        "시트를 자동 선택합니다."
+                    ),
                 },
                 "cancer_type": {
                     "type": "string",
@@ -238,10 +243,12 @@ TOOLS = [
     Tool(
         name="hira_read_pdf",
         description=(
-            "다운로드된 HIRA 항암화학요법 공고전문 PDF 파일을 읽습니다. "
-            "하이브리드 방식: 텍스트 페이지는 텍스트로, 테이블 페이지는 "
-            "이미지(DPI 150)로 반환합니다. 섹션별/페이지별 조회를 지원합니다. "
-            "사용 예: 급여기준 섹션 조회, 특정 페이지 범위 열람"
+            "다운로드된 HIRA 항암화학요법 공고전문 PDF(274p)를 읽습니다. "
+            "추천 사용법: (1) cancer_type으로 암종별 페이지 자동 조회, "
+            "(2) search로 약제명/키워드 검색, (3) pages로 특정 페이지 직접 열람. "
+            "파라미터 없이 호출하면 목차(암종별 페이지 매핑)를 반환합니다. "
+            "테이블 페이지는 이미지로, 텍스트 페이지는 텍스트로 반환합니다. "
+            "넓은 범위 조회 시 text_only=true로 1MB 제한을 회피할 수 있습니다."
         ),
         inputSchema={
             "type": "object",
@@ -254,20 +261,44 @@ TOOLS = [
                     ),
                     "default": "항암화학요법_공고전문",
                 },
+                "cancer_type": {
+                    "type": "string",
+                    "description": (
+                        "암종명으로 해당 페이지 범위를 자동 조회합니다. "
+                        "한글/영문 모두 지원. "
+                        "예: '난소암', 'ovarian', '유방암', 'breast', "
+                        "'비소세포폐암', 'NSCLC'"
+                    ),
+                },
+                "search": {
+                    "type": "string",
+                    "description": (
+                        "PDF 전체에서 키워드를 검색합니다. "
+                        "약제명, 암종명, 요법명 등으로 검색 가능. "
+                        "예: 'trastuzumab deruxtecan', 'pembrolizumab', '난소암'"
+                    ),
+                },
                 "pages": {
                     "type": "string",
                     "description": (
-                        "페이지 범위 (예: '1-10', '5', '1,3,7-10'). "
-                        "생략 시 처음 50페이지. 1-indexed."
+                        "페이지 범위 (예: '1-10', '5', '1,3,7-10'). 1-indexed. "
+                        "테이블이 많은 범위는 2~3p씩 요청 권장."
                     ),
                 },
                 "section": {
                     "type": "string",
                     "description": (
-                        "섹션 필터. 키워드로 해당 섹션의 시작~끝 페이지를 "
-                        "자동 탐색합니다. 가능한 값: "
-                        "개요, 급여기준, 약제목록, 별표, 부록"
+                        "섹션 필터. 가능한 값: "
+                        "일반원칙, 암종별항암요법, 항암면역요법제, 항구토제, 별표, 부록"
                     ),
+                },
+                "text_only": {
+                    "type": "boolean",
+                    "description": (
+                        "true로 설정하면 이미지 없이 텍스트만 반환합니다. "
+                        "넓은 페이지 범위 조회 시 1MB 제한 회피에 유용합니다."
+                    ),
+                    "default": False,
                 },
             },
         },
@@ -646,6 +677,9 @@ async def _handle_read_pdf(args: dict) -> list[TextContent | ImageContent]:
         filepath,
         pages=args.get("pages"),
         section=args.get("section"),
+        cancer_type=args.get("cancer_type"),
+        search=args.get("search"),
+        text_only=args.get("text_only", False),
     )
 
 

@@ -25,6 +25,14 @@ logger = logging.getLogger("hira-mcp-reader")
 # Excel 리더 (openpyxl)
 # ─────────────────────────────────────────────────────────────────────
 
+# 선호 시트 키워드 (sheet 미지정 시 이 키워드를 포함하는 시트를 우선 선택)
+_PREFERRED_SHEET_KEYWORDS = ["인정", "용법용량"]
+
+# 헤더 행 판별용 키워드 (이 중 2개 이상 포함 시 헤더로 간주)
+_HEADER_KEYWORDS = ["요법코드", "암종", "항암화학요법", "투여대상", "투여단계",
+                    "연번", "구분", "적응증", "약제", "성분명"]
+
+
 def read_excel(
     filepath: Path,
     *,
@@ -37,7 +45,7 @@ def read_excel(
 
     Args:
         filepath: .xlsx 파일 경로
-        sheet: 시트 이름 (None이면 활성 시트)
+        sheet: 시트 이름 (None이면 자동 선택)
         cancer_type: 암종 필터 (예: "난소암", "자궁경부암")
         max_rows: 최대 반환 행 수 (토큰 제한 방지)
 
@@ -57,7 +65,7 @@ def read_excel(
             )]
         ws = wb[sheet]
     else:
-        ws = wb.active
+        ws = _select_preferred_sheet(wb)
 
     # ── 머지셀 forward-fill 맵 구축 ─────────────────────────────
     merge_map: dict[tuple[int, int], Any] = {}
@@ -83,24 +91,24 @@ def read_excel(
             cells.append(str(val).strip() if val is not None else "")
         all_rows.append(cells)
 
+    sheet_title = ws.title
+    sheet_names = wb.sheetnames
     wb.close()
 
     if not all_rows:
         return [TextContent(type="text", text="⚠️ 시트에 데이터가 없습니다.")]
 
-    # ── 헤더 감지 (첫 번째 비어있지 않은 행) ────────────────────
-    header_idx = 0
-    for i, row in enumerate(all_rows):
-        if any(c for c in row):
-            header_idx = i
-            break
+    # ── 헤더 감지 (키워드 기반) ──────────────────────────────────
+    header_idx = _find_header_row(all_rows)
 
     headers = all_rows[header_idx]
     data_rows = all_rows[header_idx + 1:]
 
+    # 빈 행 제거 (모든 셀이 비어있는 행)
+    data_rows = [row for row in data_rows if any(c for c in row)]
+
     # ── 암종 필터 적용 ──────────────────────────────────────────
     if cancer_type:
-        # 주로 C열(index 2) 또는 암종 관련 컬럼에서 필터
         cancer_col_idx = _find_cancer_column(headers)
         if cancer_col_idx is not None:
             data_rows = [
@@ -117,7 +125,7 @@ def read_excel(
 
     # ── 요약 정보 ──────────────────────────────────────────────
     summary_parts = [
-        f"📊 시트: {ws.title}",
+        f"📊 시트: {sheet_title}",
         f"📏 전체 행: {total_count}행",
     ]
     if cancer_type:
@@ -126,20 +134,46 @@ def read_excel(
         summary_parts.append(f"⚠️ {max_rows}행까지만 표시 (전체 {total_count}행)")
 
     summary = " | ".join(summary_parts)
+    sheets_info = f"사용 가능한 시트: {', '.join(sheet_names)}"
 
-    return [TextContent(type="text", text=f"{summary}\n\n{md_lines}")]
+    return [TextContent(type="text", text=f"{summary}\n{sheets_info}\n\n{md_lines}")]
+
+
+def _select_preferred_sheet(wb):
+    """선호 시트를 자동 선택합니다. 키워드 매칭 → 활성 시트 순."""
+    for name in wb.sheetnames:
+        if all(kw in name for kw in _PREFERRED_SHEET_KEYWORDS):
+            logger.info(f"선호 시트 자동 선택: {name}")
+            return wb[name]
+    return wb.active
+
+
+def _find_header_row(all_rows: list[list[str]]) -> int:
+    """헤더 키워드가 포함된 행을 찾습니다. 없으면 첫 비어있지 않은 행."""
+    for i, row in enumerate(all_rows):
+        row_text = " ".join(row).lower()
+        matches = sum(1 for kw in _HEADER_KEYWORDS if kw in row_text)
+        if matches >= 2:
+            return i
+
+    # fallback: 첫 번째 비어있지 않은 행
+    for i, row in enumerate(all_rows):
+        if any(c for c in row):
+            return i
+    return 0
 
 
 def _find_cancer_column(headers: list[str]) -> int | None:
     """헤더에서 암종 관련 컬럼 인덱스를 찾습니다."""
-    cancer_keywords = ["암종", "cancer", "질환", "적응증", "진단"]
+    cancer_keywords = ["암종", "cancer", "질환", "적응증", "진단", "암 종"]
     for idx, h in enumerate(headers):
         h_lower = h.lower()
         if any(kw in h_lower for kw in cancer_keywords):
             return idx
-    # 기본 fallback: C열 (index 2) — HIRA 엑셀 관행
-    if len(headers) > 2:
-        return 2
+    # fallback: "투여대상" 컬럼 (암종명이 투여대상에 포함되는 경우도 있음)
+    for idx, h in enumerate(headers):
+        if "투여대상" in h:
+            return idx
     return None
 
 
@@ -176,14 +210,60 @@ def _to_markdown_table(headers: list[str], rows: list[list[str]]) -> str:
 _TABLE_THRESHOLD = 1  # pdfplumber가 N개 이상 테이블 감지 시 → 이미지 렌더링
 _MAX_PAGES_PER_CALL = 50  # 한 번에 처리할 최대 페이지 (토큰 제한 방지)
 _IMAGE_DPI = 150  # ImageContent 해상도
+_MAX_IMAGE_PAGES = 5  # 이미지 렌더링 최대 페이지 (1MB 제한 방지)
+
+# 암종 영한 매핑 (검색용)
+_CANCER_ALIASES: dict[str, list[str]] = {
+    "소세포폐암": ["small cell lung", "sclc"],
+    "비소세포폐암": ["non-small cell lung", "nsclc"],
+    "위암": ["gastric", "stomach"],
+    "식도암": ["esophageal", "esophagus"],
+    "갑상선암": ["thyroid"],
+    "췌장암": ["pancreatic", "pancreas"],
+    "간암": ["hepatocellular", "liver", "hcc"],
+    "담도암": ["biliary", "cholangiocarcinoma"],
+    "직결장암": ["colorectal", "colon", "rectal", "crc"],
+    "유방암": ["breast"],
+    "난소암": ["ovarian", "ovary"],
+    "난관암": ["fallopian"],
+    "자궁경부암": ["cervical", "cervix"],
+    "자궁암": ["uterine", "endometrial"],
+    "자궁내막암": ["endometrial", "endometrium"],
+    "신장암": ["renal", "kidney", "rcc"],
+    "요로상피암": ["urothelial", "bladder"],
+    "전립선암": ["prostate"],
+    "두경부암": ["head and neck", "head & neck"],
+    "신경내분비암": ["neuroendocrine", "net"],
+    "메르켈세포암": ["merkel"],
+    "피부암": ["skin", "bcc", "scc"],
+    "골암": ["bone", "osteosarcoma"],
+    "중추신경계암": ["cns", "brain", "glioma", "glioblastoma"],
+    "악성흑색종": ["melanoma"],
+    "연조직육종": ["soft tissue sarcoma"],
+    "횡문근육종": ["rhabdomyosarcoma"],
+    "생식세포종양": ["germ cell"],
+    "신경모세포종": ["neuroblastoma"],
+    "윌름즈종양": ["wilms"],
+    "망막모세포종": ["retinoblastoma"],
+    "비호지킨림프종": ["non-hodgkin", "nhl", "lymphoma"],
+    "호지킨림프종": ["hodgkin"],
+    "다발골수종": ["multiple myeloma", "myeloma"],
+    "급성골수성백혈병": ["aml", "acute myeloid"],
+    "급성전골수구성백혈병": ["apl", "promyelocytic"],
+    "만성골수성백혈병": ["cml", "chronic myeloid"],
+    "급성림프모구백혈병": ["all", "acute lymphoblastic"],
+    "만성림프구성백혈병": ["cll", "chronic lymphocytic"],
+    "골수형성이상증후군": ["mds", "myelodysplastic"],
+}
 
 # PDF 섹션별 키워드 매핑 (항암화학요법 공고전문 구조)
 PDF_SECTIONS: dict[str, list[str]] = {
-    "개요": ["개요", "총칙", "일반원칙"],
-    "급여기준": ["급여기준", "요양급여"],
-    "약제목록": ["약제", "목록"],
+    "일반원칙": ["일반원칙"],
+    "암종별항암요법": ["주요 암종별 항암요법"],
+    "항암면역요법제": ["항암면역요법제"],
+    "항구토제": ["항구토제"],
     "별표": ["별표", "[별표"],
-    "부록": ["부록", "참고"],
+    "부록": ["부록", "부표"],
 }
 
 
@@ -192,17 +272,20 @@ def read_pdf(
     *,
     pages: str | None = None,
     section: str | None = None,
+    cancer_type: str | None = None,
+    search: str | None = None,
+    text_only: bool = False,
 ) -> list[TextContent | ImageContent]:
     """
     PDF를 하이브리드 방식으로 읽습니다.
 
-    - 텍스트 전용 페이지 → pdfplumber.extract_text() → TextContent
-    - 테이블 포함 페이지 → PyMuPDF pixmap(DPI 150) → ImageContent (base64 PNG)
-
     Args:
         filepath: .pdf 파일 경로
         pages: 페이지 범위 (예: "1-10", "5", "1,3,7-10"). None이면 처음 50p.
-        section: 섹션 필터 (예: "개요", "급여기준", "별표"). 키워드로 시작 페이지 탐색.
+        section: 섹션 필터 (예: "일반원칙", "별표").
+        cancer_type: 암종명 (예: "난소암", "ovarian"). TOC에서 페이지 범위 자동 탐색.
+        search: 키워드 검색 (예: 약제명, 암종명). 매칭 페이지와 주변 텍스트 반환.
+        text_only: True이면 이미지 없이 텍스트만 반환 (1MB 제한 회피).
 
     Returns:
         list[TextContent | ImageContent] 혼합 리스트
@@ -213,9 +296,29 @@ def read_pdf(
     doc = fitz.open(str(filepath))
     total_pages = len(doc)
 
+    # ── 키워드 검색 모드 ────────────────────────────────────────
+    if search:
+        doc.close()
+        return _search_pdf(filepath, search, total_pages)
+
     # ── 페이지 범위 결정 ────────────────────────────────────────
-    if section:
-        page_indices = _find_section_pages(filepath, section, total_pages)
+    range_label = None  # 사용자에게 보여줄 범위 설명
+
+    if cancer_type:
+        toc, toc_page_idx = _parse_toc(filepath)
+        page_indices, matched_name = _find_cancer_pages(toc, cancer_type, total_pages, filepath, toc_page_idx)
+        if not page_indices:
+            doc.close()
+            available = ", ".join(e["name"] for e in toc) if toc else "(TOC 파싱 실패)"
+            return [TextContent(
+                type="text",
+                text=f"⚠️ 암종 '{cancer_type}'을 목차에서 찾을 수 없습니다.\n"
+                     f"사용 가능한 암종: {available}"
+            )]
+        range_label = f"🔍 암종: '{matched_name}'"
+    elif section:
+        toc, toc_page_idx = _parse_toc(filepath)
+        page_indices = _find_section_pages_from_toc(toc, section, filepath, total_pages, toc_page_idx)
         if not page_indices:
             doc.close()
             return [TextContent(
@@ -224,15 +327,24 @@ def read_pdf(
                      f"사용 가능한 섹션: {', '.join(PDF_SECTIONS.keys())}\n"
                      f"총 {total_pages}페이지"
             )]
+        range_label = f"🔍 섹션: '{section}'"
     elif pages:
         page_indices = _parse_page_range(pages, total_pages)
     else:
-        # 기본: 처음 50페이지
+        # 기본: TOC 페이지를 보여줌 (사용자가 탐색할 수 있도록)
+        toc, _toc_idx = _parse_toc(filepath)
+        if toc:
+            doc.close()
+            return _format_toc_response(filepath, toc, total_pages)
         page_indices = list(range(min(total_pages, _MAX_PAGES_PER_CALL)))
 
     # 50페이지 제한 적용
     truncated = len(page_indices) > _MAX_PAGES_PER_CALL
     page_indices = page_indices[:_MAX_PAGES_PER_CALL]
+
+    # ── 이미지 페이지 수 제한 (1MB 방지) ────────────────────────
+    # text_only가 아닌 경우에도 이미지 페이지 수를 제한
+    image_page_count = 0
 
     # ── 페이지별 타입 감지 + 파싱 ─────────────────────────────
     results: list[TextContent | ImageContent] = []
@@ -245,8 +357,10 @@ def read_pdf(
     )
     if truncated:
         meta += f"\n⚠️ {_MAX_PAGES_PER_CALL}p 제한 적용됨"
-    if section:
-        meta += f"\n🔍 섹션 필터: '{section}'"
+    if range_label:
+        meta += f"\n{range_label}"
+    if text_only:
+        meta += "\n📝 텍스트 전용 모드"
     results.append(TextContent(type="text", text=meta))
 
     # pdfplumber로 테이블 감지
@@ -257,15 +371,25 @@ def read_pdf(
     for page_idx in page_indices:
         page_num = page_idx + 1  # 1-indexed
 
-        # pdfplumber로 테이블 감지
         try:
             plumber_page = pdf_plumber.pages[page_idx]
+        except IndexError:
+            continue
+
+        # text_only 모드이면 항상 텍스트 추출
+        if text_only:
+            text = _extract_text_safe(plumber_page, page_num)
+            text_buffer.append(text)
+            continue
+
+        # pdfplumber로 테이블 감지
+        try:
             tables = plumber_page.find_tables()
             has_tables = len(tables) >= _TABLE_THRESHOLD
         except Exception:
             has_tables = False
 
-        if has_tables:
+        if has_tables and image_page_count < _MAX_IMAGE_PAGES:
             # 텍스트 버퍼가 있으면 먼저 flush
             if text_buffer:
                 results.append(TextContent(
@@ -291,21 +415,35 @@ def read_pdf(
                     data=b64_data,
                     mimeType="image/png",
                 ))
+                image_page_count += 1
             except Exception as e:
                 logger.warning(f"페이지 {page_num} 이미지 렌더링 실패: {e}")
-                # 폴백: 텍스트 추출 시도
                 text = _extract_text_safe(plumber_page, page_num)
                 text_buffer.append(text)
-
         else:
-            # 텍스트 전용 페이지 → pdfplumber 텍스트 추출
-            text = _extract_text_safe(plumber_page, page_num)
-            text_buffer.append(text)
+            # 텍스트 전용 페이지 또는 이미지 제한 초과
+            if has_tables and image_page_count >= _MAX_IMAGE_PAGES:
+                text = _extract_text_safe(plumber_page, page_num)
+                text_buffer.append(
+                    f"--- p.{page_num} (테이블 포함, 이미지 제한 초과 → 텍스트) ---\n"
+                    + text.split("\n", 1)[-1] if "\n" in text else text
+                )
+            else:
+                text = _extract_text_safe(plumber_page, page_num)
+                text_buffer.append(text)
 
     # 남은 텍스트 버퍼 flush
     if text_buffer:
         results.append(TextContent(
             type="text", text="\n\n".join(text_buffer)
+        ))
+
+    if image_page_count >= _MAX_IMAGE_PAGES:
+        results.append(TextContent(
+            type="text",
+            text=f"\n⚠️ 이미지 렌더링 {_MAX_IMAGE_PAGES}p 제한 도달. "
+                 f"나머지 테이블 페이지는 텍스트로 반환됨. "
+                 f"text_only=true로 전체 텍스트 조회 가능."
         ))
 
     pdf_plumber.close()
@@ -326,29 +464,328 @@ def _extract_text_safe(plumber_page, page_num: int) -> str:
         return f"--- p.{page_num} (추출 실패: {e}) ---"
 
 
-def _find_section_pages(
-    filepath: Path, section: str, total_pages: int
-) -> list[int]:
-    """
-    PDF에서 섹션 키워드가 포함된 페이지 범위를 탐색합니다.
+# ─────────────────────────────────────────────────────────────────────
+# PDF TOC 파싱 (목차에서 암종→페이지 매핑 추출)
+# ─────────────────────────────────────────────────────────────────────
+import re
 
-    전략: 섹션 시작 페이지를 찾은 뒤, 다음 섹션 시작까지의 범위를 반환.
+# 항목 시작 패턴: "숫자. " 또는 "숫자-숫자. "
+_TOC_ENTRY_START = re.compile(r"(\d+(?:-\d+)?)\.\s")
+
+# 섹션 레벨 패턴: "□ 섹션명···숫자"
+_TOC_SECTION_PATTERN = re.compile(r"□\s*(.+?)·+\s*(\d+)")
+
+
+def _parse_toc_entries_from_line(line: str) -> list[dict]:
+    """한 줄에서 TOC 항목들을 추출합니다 (두 컬럼 대응)."""
+    entries = []
+    # 항목 시작 위치 찾기
+    starts = list(_TOC_ENTRY_START.finditer(line))
+    for i, match in enumerate(starts):
+        num = match.group(1)
+        text_start = match.end()
+        # 다음 항목 시작 또는 줄 끝까지가 이 항목의 텍스트
+        text_end = starts[i + 1].start() if i + 1 < len(starts) else len(line)
+        segment = line[text_start:text_end].strip()
+
+        # segment에서 이름과 페이지 번호 분리
+        # 패턴: "이름·····숫자" 또는 "이름 숫자" (마지막 숫자가 페이지)
+        # 먼저 dot 구분 시도 (첫 번째 ·+숫자 매칭 — 비탐욕적)
+        dot_match = re.match(r"(.+?)·+(\d+)", segment)
+        if dot_match:
+            name = dot_match.group(1).strip()
+            page = int(dot_match.group(2))
+        else:
+            # dot 없는 경우: 마지막 숫자를 페이지로 추출
+            num_match = re.search(r"\s(\d+)\s*$", segment)
+            if num_match:
+                name = segment[:num_match.start()].strip()
+                page = int(num_match.group(1))
+            else:
+                continue  # 파싱 실패 → 건너뜀
+
+        name = re.sub(r"\s+", " ", name)
+        if name and page > 0:
+            entries.append({"num": num, "name": name, "page": page})
+
+    return entries
+
+
+def _parse_toc(filepath: Path) -> tuple[list[dict], int]:
+    """
+    PDF 목차 페이지를 파싱하여 암종별 페이지 매핑을 추출합니다.
+
+    Returns:
+        (entries, toc_page_idx) where entries is
+        [{"num": "1", "name": "소세포폐암", "page": 16}, ...]
+        페이지 번호 순으로 정렬됨. toc_page_idx는 목차 페이지의 실제 PDF 인덱스.
     """
     import pdfplumber
 
-    keywords = PDF_SECTIONS.get(section, [section])
+    pdf = pdfplumber.open(str(filepath))
+    toc_entries: list[dict] = []
+    section_entries: list[dict] = []
+
+    # 목차 페이지 탐색 — 가장 많은 항목이 있는 페이지를 선택
+    best_page_idx = -1
+    best_count = 0
+    for i in range(25, min(50, len(pdf.pages))):
+        text = pdf.pages[i].extract_text() or ""
+        if "일반원칙" in text and "암종별" in text:
+            count = len(list(_TOC_ENTRY_START.finditer(text)))
+            if count > best_count:
+                best_count = count
+                best_page_idx = i
+
+    if best_page_idx >= 0:
+        text = pdf.pages[best_page_idx].extract_text() or ""
+
+        # 섹션 레벨 항목 추출
+        for match in _TOC_SECTION_PATTERN.finditer(text):
+            name, page = match.group(1).strip(), int(match.group(2))
+            section_entries.append({"name": name, "page": page})
+
+        # 줄 단위로 암종 항목 추출
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line or line.startswith("□") or line.startswith("암환자"):
+                continue
+            entries = _parse_toc_entries_from_line(line)
+            toc_entries.extend(entries)
+
+    pdf.close()
+
+    # 페이지 번호 순 정렬 (두 컬럼이 섞여있으므로)
+    toc_entries.sort(key=lambda e: e["page"])
+
+    # 중복 제거 (같은 페이지)
+    seen = set()
+    unique = []
+    for entry in toc_entries:
+        if entry["page"] not in seen:
+            seen.add(entry["page"])
+            unique.append(entry)
+    toc_entries = unique
+
+    # 각 항목의 end_page 계산 (다음 항목의 시작 - 1)
+    for i, entry in enumerate(toc_entries):
+        if i + 1 < len(toc_entries):
+            entry["end_page"] = toc_entries[i + 1]["page"] - 1
+        else:
+            # 마지막 암종 항목: "항암면역요법제" 섹션 시작 전까지
+            next_section_page = None
+            for sec in section_entries:
+                if sec["page"] > entry["page"]:
+                    next_section_page = sec["page"]
+                    break
+            entry["end_page"] = (next_section_page - 1) if next_section_page else entry["page"] + 10
+
+    logger.info(f"TOC 파싱 완료: {len(toc_entries)}개 항목, TOC page idx={best_page_idx}")
+    return toc_entries, best_page_idx
+
+
+def _find_cancer_pages(
+    toc: list[dict], cancer_type: str, total_pages: int,
+    filepath: Path | None = None,
+    toc_page_idx: int = -1,
+) -> tuple[list[int], str]:
+    """
+    TOC에서 암종명으로 페이지 범위를 찾습니다. 퍼지 매칭 지원.
+
+    Returns:
+        (page_indices, matched_name) — 못 찾으면 ([], "")
+    """
+    query = cancer_type.lower().strip()
+
+    def _resolve(entry: dict) -> tuple[list[int], str]:
+        start, end = _toc_page_to_indices(entry, toc, total_pages, filepath, toc_page_idx)
+        return list(range(start, end + 1)), entry["name"]
+
+    # 1단계: 정확한 한글 이름 매칭
+    for entry in toc:
+        if query in entry["name"]:
+            return _resolve(entry)
+
+    # 2단계: 영문 별칭 매칭
+    for korean_name, aliases in _CANCER_ALIASES.items():
+        if query in korean_name or any(alias in query for alias in aliases):
+            for entry in toc:
+                if korean_name in entry["name"]:
+                    return _resolve(entry)
+
+    # 3단계: 부분 매칭 (가장 유사한 항목)
+    for entry in toc:
+        entry_lower = entry["name"].lower()
+        if any(c in entry_lower for c in query if len(c) > 1):
+            return _resolve(entry)
+
+    return [], ""
+
+
+_toc_offset_cache: dict[str, int] = {}
+
+
+def _calc_toc_offset(
+    filepath: Path, toc: list[dict], toc_page_idx: int = -1
+) -> int:
+    """
+    TOC 페이지 번호와 실제 PDF 페이지의 오프셋을 계산합니다.
+
+    방법: TOC 직후 첫 콘텐츠 페이지의 하단 인쇄 페이지 번호를 읽어서
+    offset = pdf_idx - printed_number + 1 로 계산.
+    """
+    cache_key = str(filepath)
+    if cache_key in _toc_offset_cache:
+        return _toc_offset_cache[cache_key]
+
+    import pdfplumber
 
     pdf = pdfplumber.open(str(filepath))
-    start_page = None
-    end_page = total_pages - 1
 
-    # 1차: 정확한 섹션 키워드로 시작 페이지 탐색
+    # 방법 1: TOC 직후 페이지의 footer 번호로 오프셋 계산
+    if toc_page_idx >= 0:
+        for scan_idx in range(toc_page_idx + 1, min(toc_page_idx + 5, len(pdf.pages))):
+            text = pdf.pages[scan_idx].extract_text() or ""
+            lines = [ln.strip() for ln in text.strip().split("\n") if ln.strip()]
+            if not lines:
+                continue
+            # footer: 마지막 줄이 숫자만 있는 경우
+            last_line = lines[-1]
+            footer_match = re.match(r"^(\d+)$", last_line)
+            if footer_match:
+                footer_num = int(footer_match.group(1))
+                offset = scan_idx - footer_num + 1
+                _toc_offset_cache[cache_key] = offset
+                pdf.close()
+                logger.info(
+                    f"TOC 오프셋 계산 (footer): {offset} "
+                    f"(PDF idx={scan_idx}, footer={footer_num})"
+                )
+                return offset
+
+    # 방법 2 (fallback): "일반원칙" 텍스트 위치 + TOC/section 항목 대조
+    for i in range(30, min(50, len(pdf.pages))):
+        text = (pdf.pages[i].extract_text() or "")[:500]
+        if "일반원칙" in text:
+            # footer 번호 확인
+            lines = [ln.strip() for ln in text.strip().split("\n") if ln.strip()]
+            footer_match = re.match(r"^(\d+)$", lines[-1]) if lines else None
+            if footer_match:
+                footer_num = int(footer_match.group(1))
+                offset = i - footer_num + 1
+                _toc_offset_cache[cache_key] = offset
+                pdf.close()
+                logger.info(f"TOC 오프셋 계산 (일반원칙 fallback): {offset}")
+                return offset
+
+    pdf.close()
+
+    # 최후 fallback
+    _toc_offset_cache[cache_key] = 33
+    logger.warning("TOC 오프셋 계산 실패, 기본값 33 사용")
+    return 33
+
+
+def _toc_page_to_indices(
+    entry: dict, toc: list[dict], total_pages: int,
+    filepath: Path | None = None,
+    toc_page_idx: int = -1,
+) -> tuple[int, int]:
+    """
+    TOC 페이지 번호(PDF 내부 번호)를 0-indexed 페이지 인덱스로 변환합니다.
+    """
+    offset = _calc_toc_offset(filepath, toc, toc_page_idx) if filepath else 33
+
+    start_idx = entry["page"] + offset - 1  # 0-indexed
+    end_idx = entry["end_page"] + offset - 1
+
+    # ±2 페이지 퍼지 검증: 암종명이 실제 해당 페이지에 있는지 확인
+    if filepath and entry.get("name"):
+        start_idx = _verify_page_with_fuzzy(
+            filepath, start_idx, entry["name"], total_pages
+        )
+        # end도 조정 (start와의 차이 유지)
+        page_span = entry["end_page"] - entry["page"]
+        end_idx = start_idx + page_span
+
+    # 범위 검증
+    start_idx = max(0, min(start_idx, total_pages - 1))
+    end_idx = max(start_idx, min(end_idx, total_pages - 1))
+
+    return start_idx, end_idx
+
+
+def _verify_page_with_fuzzy(
+    filepath: Path, expected_idx: int, cancer_name: str, total_pages: int,
+    search_range: int = 2,
+) -> int:
+    """
+    예상 페이지 ±search_range 범위에서 암종명을 검색하여 실제 시작 페이지를 반환합니다.
+    찾지 못하면 원래 expected_idx를 반환합니다.
+    """
+    import pdfplumber
+
+    # 짧은 이름 추출 (예: "난소암/난관암/일차복막암" → ["난소암", "난관암"])
+    name_parts = [p.strip() for p in cancer_name.replace("/", "|").split("|") if len(p.strip()) >= 2]
+    if not name_parts:
+        return expected_idx
+
+    pdf = pdfplumber.open(str(filepath))
+    try:
+        # 예상 페이지 먼저 확인
+        if 0 <= expected_idx < total_pages:
+            text = (pdf.pages[expected_idx].extract_text() or "")[:500]
+            if any(part in text for part in name_parts):
+                return expected_idx
+
+        # ±search_range 탐색
+        for delta in range(1, search_range + 1):
+            for candidate in [expected_idx + delta, expected_idx - delta]:
+                if 0 <= candidate < total_pages:
+                    text = (pdf.pages[candidate].extract_text() or "")[:500]
+                    if any(part in text for part in name_parts):
+                        logger.info(
+                            f"퍼지 검증: '{cancer_name}' 페이지 조정 "
+                            f"{expected_idx} → {candidate}"
+                        )
+                        return candidate
+    finally:
+        pdf.close()
+
+    return expected_idx
+
+
+def _find_section_pages_from_toc(
+    toc: list[dict], section: str, filepath: Path, total_pages: int,
+    toc_page_idx: int = -1,
+) -> list[int]:
+    """TOC 기반으로 섹션 페이지 범위를 찾습니다. 실패 시 텍스트 스캔 폴백."""
+    keywords = PDF_SECTIONS.get(section, [section])
+
+    # TOC에서 검색
+    for entry in toc:
+        if any(kw in entry["name"] for kw in keywords):
+            start, end = _toc_page_to_indices(entry, toc, total_pages, filepath, toc_page_idx)
+            return list(range(start, end + 1))
+
+    # 폴백: 텍스트 스캔
+    return _find_section_pages_by_scan(filepath, section, total_pages)
+
+
+def _find_section_pages_by_scan(
+    filepath: Path, section: str, total_pages: int
+) -> list[int]:
+    """PDF 전체를 스캔하여 섹션 페이지를 찾습니다 (폴백)."""
+    import pdfplumber
+
+    keywords = PDF_SECTIONS.get(section, [section])
+    pdf = pdfplumber.open(str(filepath))
+    start_page = None
+
     for i, page in enumerate(pdf.pages):
         text = (page.extract_text() or "").strip()
         if not text:
             continue
-
-        # 페이지의 처음 500자에서 키워드 검색 (제목은 상단에 위치)
         header = text[:500]
         if any(kw in header for kw in keywords):
             start_page = i
@@ -358,22 +795,105 @@ def _find_section_pages(
         pdf.close()
         return []
 
-    # 2차: 다음 섹션 시작점 탐색 (최대 100페이지 범위)
-    other_section_keywords = []
+    # 다음 섹션 시작점 탐색
+    end_page = min(start_page + 50, total_pages - 1)
+    other_keywords = []
     for sec_name, sec_kws in PDF_SECTIONS.items():
         if sec_name != section:
-            other_section_keywords.extend(sec_kws)
+            other_keywords.extend(sec_kws)
 
     for i in range(start_page + 1, min(start_page + 100, total_pages)):
         text = (pdf.pages[i].extract_text() or "").strip()
-        header = text[:500]
-        if any(kw in header for kw in other_section_keywords):
+        if any(kw in text[:500] for kw in other_keywords):
             end_page = i - 1
             break
 
     pdf.close()
-
     return list(range(start_page, end_page + 1))
+
+
+# ─────────────────────────────────────────────────────────────────────
+# PDF 키워드 검색
+# ─────────────────────────────────────────────────────────────────────
+_SEARCH_MAX_RESULTS = 20
+_SEARCH_CONTEXT_CHARS = 200
+
+
+def _search_pdf(
+    filepath: Path, keyword: str, total_pages: int
+) -> list[TextContent]:
+    """PDF 전체에서 키워드를 검색하여 매칭 페이지와 주변 텍스트를 반환합니다."""
+    import pdfplumber
+
+    pdf = pdfplumber.open(str(filepath))
+    matches: list[dict] = []
+    keyword_lower = keyword.lower()
+
+    for i, page in enumerate(pdf.pages):
+        if len(matches) >= _SEARCH_MAX_RESULTS:
+            break
+        text = page.extract_text() or ""
+        if keyword_lower in text.lower():
+            # 매칭 위치의 주변 텍스트 추출
+            idx = text.lower().index(keyword_lower)
+            start = max(0, idx - _SEARCH_CONTEXT_CHARS)
+            end = min(len(text), idx + len(keyword) + _SEARCH_CONTEXT_CHARS)
+            context = text[start:end].strip()
+            if start > 0:
+                context = "…" + context
+            if end < len(text):
+                context = context + "…"
+            matches.append({"page": i + 1, "context": context})
+
+    pdf.close()
+
+    if not matches:
+        return [TextContent(
+            type="text",
+            text=f"🔍 '{keyword}' 검색 결과: 0건 (전체 {total_pages}p 검색)\n"
+                 "다른 키워드나 영문/한글 변형을 시도해보세요."
+        )]
+
+    lines = [
+        f"🔍 '{keyword}' 검색 결과: {len(matches)}건 "
+        f"(전체 {total_pages}p 검색)",
+        "─" * 40,
+    ]
+    for m in matches:
+        lines.append(f"\n📍 p.{m['page']}:")
+        lines.append(m["context"])
+
+    lines.append("\n─" * 40)
+    lines.append(
+        "💡 특정 페이지를 자세히 보려면 pages 파라미터를 사용하세요. "
+        "예: pages='" + ",".join(str(m["page"]) for m in matches[:5]) + "'"
+    )
+
+    return [TextContent(type="text", text="\n".join(lines))]
+
+
+def _format_toc_response(
+    filepath: Path, toc: list[dict], total_pages: int
+) -> list[TextContent]:
+    """TOC를 보기 좋게 포맷하여 반환합니다."""
+    lines = [
+        f"📄 PDF: {filepath.name} ({total_pages}p)",
+        "",
+        "📋 목차 (cancer_type 파라미터로 암종별 조회 가능):",
+        "─" * 50,
+    ]
+    for entry in toc:
+        lines.append(f"  {entry['num']:>5}. {entry['name']:<20} → p.{entry['page']}")
+
+    lines.append("─" * 50)
+    lines.append("")
+    lines.append("💡 사용법:")
+    lines.append("  • cancer_type='난소암' → 해당 암종 페이지 자동 조회")
+    lines.append("  • search='trastuzumab' → 전체 PDF에서 키워드 검색")
+    lines.append("  • pages='64-68' → 특정 페이지 범위 직접 조회")
+    lines.append("  • text_only=true → 이미지 없이 텍스트만 (넓은 범위 조회)")
+
+    return [TextContent(type="text", text="\n".join(lines))]
 
 
 def _parse_page_range(pages_str: str, total: int) -> list[int]:

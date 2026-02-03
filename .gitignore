@@ -208,4 +208,5 @@ __marimo__/
 
 # Project-specific
 .ref/
+.claude/
 CLAUDE.md
